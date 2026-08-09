@@ -23,14 +23,17 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower-jmusicbot
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    restart: unless-stopped
-    command: --interval 3600 --label-enable --cleanup
-
+# No per-stack Watchtower here. This host already runs one Watchtower
+# instance (deployed with the Twitch bot, --label-enable) that hunts down
+# and REMOVES any other Watchtower container it finds -- running a second
+# instance, even scoped/uniquely-named, gets it killed within one poll
+# cycle. The existing instance's --label-enable scanning is host-wide, so
+# it already picks up jmusicbot/release-notifier via the
+# com.centurylinklabs.watchtower.enable label above regardless of which
+# compose project started them. If that instance is ever removed, redeploy
+# it (see the Twitch bot repo's watchtower service) rather than adding a
+# new one here.
+#
 # Dashboard/alerting for the jmusicbot container itself is handled
 # separately by the shared observability stack (monitors this container
 # by name alongside the Twitch bot and host health) -- not duplicated here.

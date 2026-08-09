@@ -68,15 +68,19 @@ an alert, and posts via a plain webhook rather than the alerting bot.
    lowercase — GHCR rejects mixed-case image names even if the actual
    GitHub username isn't lowercase; the build workflow lowercases it too).
 
-6. **Check for a name collision on Watchtower.** If a Watchtower container
-   already exists on this machine (e.g. from another project), do NOT run a
-   second global/unscoped Watchtower — confirm the existing one uses
-   `--label-enable`, and make sure the
-   `com.centurylinklabs.watchtower.enable=true` label is present on the
-   jmusicbot and release-notifier services. A second scoped instance
-   (different container name, already set here as `watchtower-jmusicbot`)
-   is also fine — just don't end up with two unscoped Watchtowers polling
-   everything.
+6. **Do NOT deploy a Watchtower service for this stack.** Confirmed by
+   direct experience on this host: `nickfedor/watchtower` actively hunts
+   down and **removes** any other Watchtower container it finds, even ones
+   with unique names and `--label-enable` scoping — it deleted the Twitch
+   bot's Watchtower within seconds of a second instance starting.
+   `docker-compose.yml` deliberately has no `watchtower` service for this
+   reason. Instead: confirm a Watchtower is already running somewhere on
+   this host (`docker ps --filter name=watchtower`), that it uses
+   `--label-enable`, and that the `jmusicbot` and `release-notifier`
+   services above carry `com.centurylinklabs.watchtower.enable=true` — that
+   existing instance will pick them up on its next poll regardless of which
+   compose project started them. If no Watchtower exists at all, redeploy
+   the Twitch bot repo's `watchtower` service rather than adding one here.
 
 7. **Get a release-notes webhook URL from the user.** This is a plain
    Discord webhook (not the alerting bot) into whatever channel they want
@@ -108,17 +112,19 @@ an alert, and posts via a plain webhook rather than the alerting bot.
     ```
 
 11. **Verify.**
-    - `docker ps` — `jmusicbot`, `jmusicbot-release-notifier`, and
-      `watchtower-jmusicbot` should all be `Up`.
+    - `docker ps` — `jmusicbot` and `jmusicbot-release-notifier` should both
+      be `Up`. There should be exactly one Watchtower container on the
+      whole host (not one per stack — see step 6).
     - `docker logs jmusicbot --tail 50` — check for a clean startup (bot
       logged in to Discord, no token/auth errors).
     - `docker logs jmusicbot-release-notifier --tail 20` — should show it
       recording a baseline release on first run (it deliberately doesn't
       post the currently-installed version as a "new release" the first
       time it starts, only ones detected after that).
-    - `docker logs watchtower-jmusicbot --tail 20` — confirm it started
-      with `--label-enable` and picked up both jmusicbot and
-      jmusicbot-release-notifier as watched targets.
+    - Check the host's single Watchtower's logs on its next poll cycle —
+      it should mention `jmusicbot` and `jmusicbot-release-notifier` as
+      scanned/watched targets, with no "removed excess Watchtower
+      containers" messages.
 
 12. **Install the systemd unit.**
     ```
