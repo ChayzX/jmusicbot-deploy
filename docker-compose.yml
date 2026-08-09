@@ -11,7 +11,7 @@ services:
   # Polls arif-banai/MusicBot's GitHub releases and posts new release notes
   # to a Discord webhook (informational channel post, not the alerting bot).
   release-notifier:
-    image: ghcr.io/REPLACE_WITH_GITHUB_OWNER/jmusicbot-release-notifier:latest
+    image: ghcr.io/chayzx/jmusicbot-release-notifier:latest
     container_name: jmusicbot-release-notifier
     volumes:
       - /home/chase/docker/jmusicbot/release-notifier-data:/data
