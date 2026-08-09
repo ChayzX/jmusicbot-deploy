@@ -50,18 +50,23 @@ an alert, and posts via a plain webhook rather than the alerting bot.
 
 4. **Create the deploy directory on the Ubuntu machine.**
    ```
-   sudo mkdir -p /opt/jmusicbot
-   sudo chown $USER:$USER /opt/jmusicbot
+   mkdir -p /home/chase/docker/jmusicbot
    ```
-   Copy `docker-compose.yml` and `.env.example` in (via `git clone` of the
-   new repo, or by copying the files directly — either is fine). The
+   No `sudo` needed, and deliberately under `$HOME` rather than `/opt`:
+   this host runs Docker Desktop, which only bind-mounts paths explicitly
+   shared with its VM (home directory is shared by default; `/opt` is
+   not) — the existing Twitch bot deploy uses the same pattern. Copy
+   `docker-compose.yml` and `.env.example` in (via `git clone` of the new
+   repo, or by copying the files directly — either is fine). The
    `release-notifier/` source and workflow don't need to live on the host;
    they live in the repo, the host just needs the compose file that
    references the published image.
 
 5. **Edit `docker-compose.yml`:** replace
    `ghcr.io/REPLACE_WITH_GITHUB_OWNER/jmusicbot-release-notifier:latest`
-   with the real GitHub owner the repo was pushed under.
+   with the real GitHub owner the repo was pushed under (must be
+   lowercase — GHCR rejects mixed-case image names even if the actual
+   GitHub username isn't lowercase; the build workflow lowercases it too).
 
 6. **Check for a name collision on Watchtower.** If a Watchtower container
    already exists on this machine (e.g. from another project), do NOT run a
@@ -78,20 +83,21 @@ an alert, and posts via a plain webhook rather than the alerting bot.
    changelog posts to show up in — could be the same "updates" channel as
    other projects, or its own. Discord: target channel > Edit Channel >
    Integrations > Webhooks > New Webhook > Copy Webhook URL. Copy
-   `.env.example` to `.env` in `/opt/jmusicbot` and set
+   `.env.example` to `.env` in `/home/chase/docker/jmusicbot` and set
    `DISCORD_RELEASE_WEBHOOK_URL`. Don't guess or fabricate it.
 
 8. **First run — generate the default jmusicbot config.**
    ```
-   cd /opt/jmusicbot
+   cd /home/chase/docker/jmusicbot
    docker compose up -d jmusicbot
    ```
-   This should create `/opt/jmusicbot/config.txt` on first launch. Confirm
-   it exists.
+   This should create `/home/chase/docker/jmusicbot/config.txt` on first
+   launch. Confirm it exists.
 
 9. **Get the Discord bot token from the user.** Do not invent or guess a
    token. Prompt the user to paste their Discord bot token, then write it
-   into the `token` field of `/opt/jmusicbot/config.txt`. Also remind them
+   into the `token` field of `/home/chase/docker/jmusicbot/config.txt`.
+   Also remind them
    that "Message Content Intent" must be enabled for the bot in the Discord
    Developer Portal (Bot > Privileged Gateway Intents) — this is a
    Discord-side setting, not something this script can do.
@@ -138,12 +144,19 @@ an alert, and posts via a plain webhook rather than the alerting bot.
     action needed here — just confirm it's covered rather than assuming.
 
 ## Notes / constraints
-- `config.txt` and any Playlists live in the bind-mounted `/opt/jmusicbot`
-  directory on the host, NOT inside the container image — Watchtower
-  pulling a new image never touches this data.
+- **Deviation from the original design**: this host runs Docker Desktop
+  (LinuxKit VM), which only bind-mounts host paths explicitly shared with
+  it — home directory is shared by default, `/opt` is not, and `sudo`
+  isn't usable non-interactively here either. So the deploy dir is
+  `/home/chase/docker/jmusicbot`, not `/opt/jmusicbot`, matching the
+  existing Twitch bot deploy's pattern.
+- `config.txt` and any Playlists live in the bind-mounted
+  `/home/chase/docker/jmusicbot` directory on the host, NOT inside the
+  container image — Watchtower pulling a new image never touches this data.
 - The release-notifier's state (which release it last saw) lives at
-  `/opt/jmusicbot/release-notifier-data/last_release.json` on the host,
-  bind-mounted so it survives image updates the same way config.txt does.
+  `/home/chase/docker/jmusicbot/release-notifier-data/last_release.json`
+  on the host, bind-mounted so it survives image updates the same way
+  config.txt does.
 - Don't pin the jmusicbot image tag to a specific version; leave it as
   `:latest` so Watchtower has something to update to. If the user later
   asks to freeze a version, swap `latest` for a specific release tag and
