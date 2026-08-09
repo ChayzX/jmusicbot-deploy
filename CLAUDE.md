@@ -126,20 +126,28 @@ an alert, and posts via a plain webhook rather than the alerting bot.
       scanned/watched targets, with no "removed excess Watchtower
       containers" messages.
 
-12. **Install the systemd unit.**
+12. **Install the systemd unit as a user unit, not a system unit.**
+    `sudo` isn't usable non-interactively on this host (no TTY available to
+    this session), so this uses `systemctl --user` instead of
+    `/etc/systemd/system`, which needs no root at all:
     ```
-    sudo cp jmusicbot.service /etc/systemd/system/jmusicbot.service
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now jmusicbot.service
+    mkdir -p ~/.config/systemd/user
+    cp jmusicbot.service ~/.config/systemd/user/jmusicbot.service
+    systemctl --user daemon-reload
+    systemctl --user enable --now jmusicbot.service
+    loginctl enable-linger $USER
     ```
+    `enable-linger` (also no root needed for a user enabling it for
+    themselves) makes the unit keep running after logout/without an active
+    session — without it, user units stop when the last session ends.
     Note: the containers' own `restart: unless-stopped` policy handles
     crash recovery; the systemd unit exists so the compose stack comes up
-    cleanly on boot and so `systemctl status jmusicbot` /
-    `journalctl -u jmusicbot` give a clean operational view.
+    cleanly on boot and so `systemctl --user status jmusicbot` /
+    `journalctl --user -u jmusicbot` give a clean operational view.
 
 13. **Final check.**
     ```
-    systemctl status jmusicbot
+    systemctl --user status jmusicbot
     ```
     Should show `active (exited)` with `RemainAfterExit=yes` — that's
     expected for a oneshot compose-up unit, not a failure.
