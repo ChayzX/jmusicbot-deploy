@@ -1,0 +1,156 @@
+# JMusicBot Deploy — Instructions for Claude Code
+
+## Goal
+Deploy arif-banai/MusicBot (a fork of JMusicBot) as its own isolated Docker
+pod on this Ubuntu machine, auto-starting on boot via systemd, and
+auto-updating whenever the upstream repo publishes a new `latest` image via
+Watchtower. Also runs a small sidecar that posts new upstream release notes
+to a Discord channel.
+
+This bot is unrelated to any other Docker stack on this machine (e.g. the
+Twitch chat game, or the shared observability stack). Keep it fully
+isolated: separate directory, separate container names, no shared networks
+unless asked.
+
+Dashboard/alerting for this container is handled separately by the shared
+`observability` repo/stack (monitors this container by name alongside the
+Twitch bot and host health) — not duplicated here. The release-notifier
+below is a distinct thing: informational changelog posts to a channel, not
+an alert, and posts via a plain webhook rather than the alerting bot.
+
+## Files provided
+- `docker-compose.yml` — jmusicbot, release-notifier, watchtower services
+- `jmusicbot.service` — systemd unit to bring the stack up on boot
+- `release-notifier/` — Dockerfile, notifier.py, requirements.txt
+- `.github/workflows/build-and-push.yml` — builds/pushes the
+  release-notifier image to GHCR on push to `main`
+- `.env.example` — template for the release-notes webhook URL
+
+## Steps
+
+1. **Put these files in their own git repo** (e.g. `jmusicbot-deploy`) and
+   push to GitHub. Ask the user for repo name/visibility if not obvious; a
+   private repo is a reasonable default. This repo now has a real CI
+   pipeline (unlike before) since it builds and publishes the
+   release-notifier image — the jmusicbot image itself still comes straight
+   from upstream (`ghcr.io/arif-banai/musicbot`), only the notifier is
+   built here.
+
+2. **After the first push, make the GHCR package public.** Same reasoning
+   as the observability stack: Watchtower on this host pulls anonymously,
+   no registry credentials configured. On GitHub: pushed repo > Packages >
+   `jmusicbot-release-notifier` > Package settings > Change visibility >
+   Public. Confirm the Actions run succeeded first (Actions tab) before
+   flipping visibility.
+
+3. **Check prerequisites.** Confirm Docker and the Docker Compose plugin are
+   installed (`docker --version`, `docker compose version`). If missing,
+   install Docker Engine via the official apt repo (not snap), then add the
+   invoking user to the `docker` group if not already a member.
+
+4. **Create the deploy directory on the Ubuntu machine.**
+   ```
+   sudo mkdir -p /opt/jmusicbot
+   sudo chown $USER:$USER /opt/jmusicbot
+   ```
+   Copy `docker-compose.yml` and `.env.example` in (via `git clone` of the
+   new repo, or by copying the files directly — either is fine). The
+   `release-notifier/` source and workflow don't need to live on the host;
+   they live in the repo, the host just needs the compose file that
+   references the published image.
+
+5. **Edit `docker-compose.yml`:** replace
+   `ghcr.io/REPLACE_WITH_GITHUB_OWNER/jmusicbot-release-notifier:latest`
+   with the real GitHub owner the repo was pushed under.
+
+6. **Check for a name collision on Watchtower.** If a Watchtower container
+   already exists on this machine (e.g. from another project), do NOT run a
+   second global/unscoped Watchtower — confirm the existing one uses
+   `--label-enable`, and make sure the
+   `com.centurylinklabs.watchtower.enable=true` label is present on the
+   jmusicbot and release-notifier services. A second scoped instance
+   (different container name, already set here as `watchtower-jmusicbot`)
+   is also fine — just don't end up with two unscoped Watchtowers polling
+   everything.
+
+7. **Get a release-notes webhook URL from the user.** This is a plain
+   Discord webhook (not the alerting bot) into whatever channel they want
+   changelog posts to show up in — could be the same "updates" channel as
+   other projects, or its own. Discord: target channel > Edit Channel >
+   Integrations > Webhooks > New Webhook > Copy Webhook URL. Copy
+   `.env.example` to `.env` in `/opt/jmusicbot` and set
+   `DISCORD_RELEASE_WEBHOOK_URL`. Don't guess or fabricate it.
+
+8. **First run — generate the default jmusicbot config.**
+   ```
+   cd /opt/jmusicbot
+   docker compose up -d jmusicbot
+   ```
+   This should create `/opt/jmusicbot/config.txt` on first launch. Confirm
+   it exists.
+
+9. **Get the Discord bot token from the user.** Do not invent or guess a
+   token. Prompt the user to paste their Discord bot token, then write it
+   into the `token` field of `/opt/jmusicbot/config.txt`. Also remind them
+   that "Message Content Intent" must be enabled for the bot in the Discord
+   Developer Portal (Bot > Privileged Gateway Intents) — this is a
+   Discord-side setting, not something this script can do.
+
+10. **Bring up the full stack.**
+    ```
+    docker compose up -d
+    ```
+
+11. **Verify.**
+    - `docker ps` — `jmusicbot`, `jmusicbot-release-notifier`, and
+      `watchtower-jmusicbot` should all be `Up`.
+    - `docker logs jmusicbot --tail 50` — check for a clean startup (bot
+      logged in to Discord, no token/auth errors).
+    - `docker logs jmusicbot-release-notifier --tail 20` — should show it
+      recording a baseline release on first run (it deliberately doesn't
+      post the currently-installed version as a "new release" the first
+      time it starts, only ones detected after that).
+    - `docker logs watchtower-jmusicbot --tail 20` — confirm it started
+      with `--label-enable` and picked up both jmusicbot and
+      jmusicbot-release-notifier as watched targets.
+
+12. **Install the systemd unit.**
+    ```
+    sudo cp jmusicbot.service /etc/systemd/system/jmusicbot.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now jmusicbot.service
+    ```
+    Note: the containers' own `restart: unless-stopped` policy handles
+    crash recovery; the systemd unit exists so the compose stack comes up
+    cleanly on boot and so `systemctl status jmusicbot` /
+    `journalctl -u jmusicbot` give a clean operational view.
+
+13. **Final check.**
+    ```
+    systemctl status jmusicbot
+    ```
+    Should show `active (exited)` with `RemainAfterExit=yes` — that's
+    expected for a oneshot compose-up unit, not a failure.
+
+14. **Point the observability stack at this container**, if not already
+    done: the `observability` repo's `WATCH_CONTAINERS` env var should
+    include `jmusicbot` by name. If that stack is already deployed, no
+    action needed here — just confirm it's covered rather than assuming.
+
+## Notes / constraints
+- `config.txt` and any Playlists live in the bind-mounted `/opt/jmusicbot`
+  directory on the host, NOT inside the container image — Watchtower
+  pulling a new image never touches this data.
+- The release-notifier's state (which release it last saw) lives at
+  `/opt/jmusicbot/release-notifier-data/last_release.json` on the host,
+  bind-mounted so it survives image updates the same way config.txt does.
+- Don't pin the jmusicbot image tag to a specific version; leave it as
+  `:latest` so Watchtower has something to update to. If the user later
+  asks to freeze a version, swap `latest` for a specific release tag and
+  note that Watchtower will then leave it alone.
+- The release-notifier polls GitHub's public releases API every 15 minutes
+  by default (`POLL_INTERVAL_SECONDS`) — no GitHub auth needed for a public
+  repo at this frequency, well under the unauthenticated rate limit.
+- If anything fails, report back the exact command and error rather than
+  silently retrying with sudo/workarounds.
+

@@ -1,0 +1,36 @@
+services:
+  jmusicbot:
+    image: ghcr.io/arif-banai/musicbot:latest
+    container_name: jmusicbot
+    volumes:
+      - /opt/jmusicbot:/musicbot
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # Polls arif-banai/MusicBot's GitHub releases and posts new release notes
+  # to a Discord webhook (informational channel post, not the alerting bot).
+  release-notifier:
+    image: ghcr.io/REPLACE_WITH_GITHUB_OWNER/jmusicbot-release-notifier:latest
+    container_name: jmusicbot-release-notifier
+    volumes:
+      - /opt/jmusicbot/release-notifier-data:/data
+    env_file:
+      - .env
+    environment:
+      - POLL_INTERVAL_SECONDS=900
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower-jmusicbot
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    command: --interval 3600 --label-enable --cleanup
+
+# Dashboard/alerting for the jmusicbot container itself is handled
+# separately by the shared observability stack (monitors this container
+# by name alongside the Twitch bot and host health) -- not duplicated here.
