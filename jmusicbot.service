@@ -1,5 +1,7 @@
 [Unit]
 Description=JMusicBot Docker Compose Stack
+After=docker-desktop.service
+Wants=docker-desktop.service
 
 [Service]
 Type=oneshot
