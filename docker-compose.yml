@@ -3,7 +3,7 @@ services:
     image: ghcr.io/arif-banai/musicbot:latest
     container_name: jmusicbot
     volumes:
-      - /home/chase/docker/jmusicbot:/musicbot
+      - ${HOME}/docker/jmusicbot:/musicbot
     restart: unless-stopped
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
@@ -14,7 +14,7 @@ services:
     image: ghcr.io/chayzx/jmusicbot-release-notifier:latest
     container_name: jmusicbot-release-notifier
     volumes:
-      - /home/chase/docker/jmusicbot/release-notifier-data:/data
+      - ${HOME}/docker/jmusicbot/release-notifier-data:/data
     env_file:
       - .env
     environment:
