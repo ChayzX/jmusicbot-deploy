@@ -27,6 +27,10 @@ variables:
     description: "arif-banai/MusicBot tag to build (blank = newest stable tag)"
   BOT_IMAGE: $CI_REGISTRY_IMAGE/jmusicbot
   NOTIFIER_IMAGE: $CI_REGISTRY_IMAGE/release-notifier
+  # Build cache lives in its own registry repository: exporting it into the
+  # image's repository while the multi-arch index is being pushed made the
+  # GitLab registry reject the index ("blob unknown") on the first run.
+  BOT_CACHE: $CI_REGISTRY_IMAGE/cache/jmusicbot:buildcache
   CLOUDFLARED_VERSION: "2026.7.3"
   CLOUDFLARED_SHA256: 9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
   KUBE_API_HOSTNAME: k8s-api.greeniespantry.uk
@@ -160,8 +164,8 @@ build-bot:
     - |
       docker buildx build musicbot \
         --platform linux/amd64,linux/arm64 \
-        --cache-from "type=registry,ref=${BOT_IMAGE}:buildcache" \
-        --cache-to "type=registry,ref=${BOT_IMAGE}:buildcache,mode=max" \
+        --cache-from "type=registry,ref=${BOT_CACHE}" \
+        --cache-to "type=registry,ref=${BOT_CACHE},mode=max,image-manifest=true,oci-mediatypes=true" \
         --tag "${BOT_IMAGE}:${IMAGE_TAG}" \
         --tag "${BOT_IMAGE}:latest" \
         --push
