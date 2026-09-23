@@ -1,0 +1,77 @@
+diff --git a/src/test/java/com/jagrosh/jmusicbot/WitnessOwnershipTest.java b/src/test/java/com/jagrosh/jmusicbot/WitnessOwnershipTest.java
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/test/java/com/jagrosh/jmusicbot/WitnessOwnershipTest.java
+@@ -0,0 +1,71 @@
++package com.jagrosh.jmusicbot;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.net.http.HttpClient;
++import java.nio.charset.StandardCharsets;
++import java.time.Clock;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++class WitnessOwnershipTest {
++    private HttpServer server;
++    private AtomicInteger renewals;
++
++    @BeforeEach
++    void setUp() throws IOException {
++        renewals = new AtomicInteger();
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/v1/authority/acquire", exchange -> respond(exchange, 200,
++                "{\"site\":\"home\",\"epoch\":7,\"token\":\"0123456789abcdef\"}"));
++        server.createContext("/v1/authority/renew", exchange -> {
++            if (renewals.incrementAndGet() == 1) {
++                respond(exchange, 200, "{\"ok\":true}");
++            } else {
++                respond(exchange, 409, "{\"error\":\"fenced\"}");
++            }
++        });
++        server.start();
++    }
++
++    @AfterEach
++    void tearDown() {
++        server.stop(0);
++    }
++
++    @Test
++    void acquiresResourceScopedLeaseAndRenewsUntilWitnessFencesIt() throws Exception {
++        WitnessOwnership ownership = new WitnessOwnership(
++                "http://127.0.0.1:" + server.getAddress().getPort(),
++                "secret", "home", "jmusicbot", 30,
++                HttpClient.newHttpClient(), Clock.systemUTC());
++
++        WitnessOwnership.Lease lease = ownership.acquire();
++        assertNotNull(lease);
++        assertEquals("home", lease.site());
++        assertEquals(7, lease.epoch());
++        assertTrue(ownership.isValid());
++        assertTrue(ownership.renewOnce());
++        assertTrue(ownership.isValid());
++        assertFalse(ownership.renewOnce());
++        assertFalse(ownership.isValid());
++    }
++
++    private static void respond(HttpExchange exchange, int status, String body) throws IOException {
++        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
++        exchange.sendResponseHeaders(status, bytes.length);
++        try (var output = exchange.getResponseBody()) {
++            output.write(bytes);
++        }
++    }
++}

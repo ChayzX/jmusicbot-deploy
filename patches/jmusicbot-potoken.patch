@@ -1,0 +1,78 @@
+diff --git a/src/main/java/com/jagrosh/jmusicbot/BotConfig.java b/src/main/java/com/jagrosh/jmusicbot/BotConfig.java
+index 2cd34d6..622c4ea 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/BotConfig.java
++++ b/src/main/java/com/jagrosh/jmusicbot/BotConfig.java
+@@ -61,6 +61,7 @@ public class BotConfig {
+     private String token, prefix, altprefix, helpWord, playlistsFolder, logLevel,
+             successEmoji, warningEmoji, errorEmoji, loadingEmoji, searchingEmoji,
+             evalEngine, guiTheme;
++    private String ytPoToken, ytVisitorData;
+     private boolean stayInChannel, songInGame, npImages, npMinimalMessage, npShowButtons, showNpProgressBar, updatealerts, useEval, dbots, useYouTubeOauth, guiEnabled;
+     private long owner, maxSeconds, aloneTimeUntilStop;
+     private long clearChannelAgeDays;
+@@ -269,6 +270,8 @@ public class BotConfig {
+         maxYTPlaylistPages = MAX_YT_PLAYLIST_PAGES.getInt(config);
+         maxHistorySize = MAX_HISTORY_SIZE.getInt(config);
+         useYouTubeOauth = USE_YOUTUBE_OAUTH.getBoolean(config);
++        ytPoToken = YT_PO_TOKEN.hasValue(config) ? YT_PO_TOKEN.getString(config) : null;
++        ytVisitorData = YT_VISITOR_DATA.hasValue(config) ? YT_VISITOR_DATA.getString(config) : null;
+         aloneTimeUntilStop = ALONE_TIME_UNTIL_STOP.getLong(config);
+         playlistsFolder = PLAYLISTS_FOLDER.getString(config);
+         aliases = ALIASES.getConfig(config);
+@@ -520,6 +523,14 @@ public class BotConfig {
+         return useYouTubeOauth;
+     }
+ 
++    public String getYTPoToken() {
++        return ytPoToken;
++    }
++
++    public String getYTVisitorData() {
++        return ytVisitorData;
++    }
++
+     public String getMaxTime() {
+         return TimeUtil.formatTime(maxSeconds * 1000);
+     }
+diff --git a/src/main/java/com/jagrosh/jmusicbot/audio/AudioSource.java b/src/main/java/com/jagrosh/jmusicbot/audio/AudioSource.java
+index fe9f8bd..27d98b4 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/audio/AudioSource.java
++++ b/src/main/java/com/jagrosh/jmusicbot/audio/AudioSource.java
+@@ -40,6 +40,7 @@ import dev.lavalink.youtube.clients.ClientOptions;
+ import dev.lavalink.youtube.clients.MWebWithThumbnail;
+ import dev.lavalink.youtube.clients.Tv;
+ import dev.lavalink.youtube.clients.TvHtml5SimplyWithThumbnail;
++import dev.lavalink.youtube.clients.Web;
+ import dev.lavalink.youtube.clients.WebWithThumbnail;
+ import dev.lavalink.youtube.clients.skeleton.Client;
+ import org.slf4j.Logger;
+@@ -242,6 +243,16 @@ public enum AudioSource
+         {
+             applyOAuth(yt, logger);
+         }
++
++        // YouTube poToken + visitorData bypass the "Sign in to confirm you're not a bot"
++        // block on the Web client (same mechanism the SeVile/MusicBot fork exposes via
++        // ytpotoken/ytvisitordata config keys). Both must be set together; a stale or
++        // incomplete pair can worsen playback, so only apply when both are present.
++        if (config.getYTPoToken() != null && config.getYTVisitorData() != null)
++        {
++            Web.setPoTokenAndVisitorData(config.getYTPoToken(), config.getYTVisitorData());
++            logger.info("Applied YouTube poToken + visitorData (Web client)");
++        }
+         return yt;
+     }
+     
+diff --git a/src/main/java/com/jagrosh/jmusicbot/config/model/ConfigOption.java b/src/main/java/com/jagrosh/jmusicbot/config/model/ConfigOption.java
+index 3d6150c..cec6cad 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/config/model/ConfigOption.java
++++ b/src/main/java/com/jagrosh/jmusicbot/config/model/ConfigOption.java
+@@ -57,6 +57,8 @@ public enum ConfigOption {
+     UPDATE_ALERTS("updates.alerts", ConfigType.BOOLEAN, false, "Whether to alert owner about updates"),
+     USE_EVAL("dangerous.eval", ConfigType.BOOLEAN, false, "Whether to enable eval command (DANGEROUS)"),
+     USE_YOUTUBE_OAUTH("playback.youtube.useOAuth", ConfigType.BOOLEAN, false, "Whether to use YouTube OAuth2 for playback"),
++    YT_PO_TOKEN("ytpotoken", ConfigType.STRING, false, "YouTube proof-of-origin token (Web client) to bypass bot checks"),
++    YT_VISITOR_DATA("ytvisitordata", ConfigType.STRING, false, "YouTube visitor data paired with ytpotoken"),
+     
+     // Numeric options
+     MAX_SECONDS("playback.maxTrackSeconds", ConfigType.LONG, false, "Maximum track length in seconds (0 = no limit)"),

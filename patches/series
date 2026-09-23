@@ -1,0 +1,10 @@
+# Applied in this order (quilt-style) on top of the upstream
+# arif-banai/MusicBot tag. Order matters: later patches touch hunks the
+# earlier ones introduce. Source of truth during the GitLab pilot is
+# chayzx/k8s-homelab scripts/patches/ -- keep the two in sync until cutover.
+voice-channel-text-chat.patch
+jmusicbot-health-endpoint.patch
+jmusicbot-active-active.patch
+jmusicbot-active-active-test.patch
+jmusicbot-potoken.patch
+jmusicbot-oauth-redaction.patch

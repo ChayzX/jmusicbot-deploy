@@ -1,0 +1,263 @@
+# JMusicBot pipeline -- GitLab pilot.
+#
+# Port of chayzx/k8s-homelab's .github/workflows/jmusicbot-deploy.yml (patched
+# bot image + guarded k3s rollout) plus this repo's own
+# .github/workflows/build-and-push.yml (release-notifier image). During the
+# pilot the GitHub workflows stay live and remain the production path; see
+# GITLAB-PILOT.md for setup, cutover, and how to back out.
+#
+#   prepare ──> build ──> deploy ──> verify ──> rollback (only on failure)
+#   (clone,     (multi-   (manual     (rollout    (kubectl rollout undo,
+#    patch,      arch      during      + Ready     only if deploy actually
+#    mvn test)   push)     pilot)      + image)    changed the image)
+
+workflow:
+  rules:
+    # One pipeline per change: MR pipelines for MRs, branch pipelines
+    # otherwise (avoids the classic duplicate branch+MR pipeline).
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # Shown as an editable field on "Run pipeline" (GitLab's workflow_dispatch).
+  UPSTREAM_REF:
+    value: ""
+    description: "arif-banai/MusicBot tag to build (blank = newest stable tag)"
+  BOT_IMAGE: $CI_REGISTRY_IMAGE/jmusicbot
+  NOTIFIER_IMAGE: $CI_REGISTRY_IMAGE/release-notifier
+  CLOUDFLARED_VERSION: "2026.7.3"
+  CLOUDFLARED_SHA256: 9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
+  KUBE_API_HOSTNAME: k8s-api.greeniespantry.uk
+
+stages: [prepare, build, deploy, verify, rollback]
+
+# ---------------------------------------------------------------------------
+# Reusable rule sets (GitLab's answer to copy-pasting `on.paths` + `if:`).
+# ---------------------------------------------------------------------------
+.bot-paths: &bot-paths
+  - patches/**/*
+  - scripts/**/*
+  - .gitlab-ci.yml
+
+.bot-rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|schedule)$/
+    - changes: *bot-paths
+
+# Anything that publishes images or touches the cluster: default branch only.
+.bot-publish-rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|schedule)$/
+    - changes: *bot-paths
+
+# Deploy is a blocking manual job (the pipeline shows a ▶ button and waits)
+# until the CI/CD variable AUTO_DEPLOY=true is set at cutover -- after that a
+# merge to main is the deployment approval, same as the GitHub workflow.
+.deploy-rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|schedule)$/ && $AUTO_DEPLOY == "true"
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|schedule)$/
+      when: manual
+    - if: $AUTO_DEPLOY == "true"
+      changes: *bot-paths
+    - changes: *bot-paths
+      when: manual
+
+# ---------------------------------------------------------------------------
+# Job templates (`extends:` -- think composite actions, but in YAML).
+# ---------------------------------------------------------------------------
+.buildx:
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: /certs
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    # QEMU so the amd64 runner can build the arm64 half (Oracle node).
+    - docker run --privileged --rm tonistiigi/binfmt --install arm64
+    - docker buildx create --use --driver docker-container
+
+# Every cluster job: open the Cloudflare Access tunnel to the k3s API, point
+# kubectl at the scoped ci-deploy kubeconfig, and refuse anything that isn't
+# the home cluster. KUBECONFIG_JMUSICBOT is a *File*-type CI/CD variable, so
+# GitLab writes it to a temp file and hands us the path -- no base64 dance.
+.kube:
+  image: alpine/k8s:1.33.4
+  # Serialises cluster mutations across pipelines (GitHub's `concurrency:`).
+  resource_group: jmusicbot-production
+  before_script:
+    - |
+      for v in CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET KUBECONFIG_JMUSICBOT; do
+        [ -n "${!v:-}" ] || { echo "missing CI/CD variable $v (see GITLAB-PILOT.md)" >&2; exit 1; }
+      done
+    - curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+    - echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c -
+    - chmod +x /usr/local/bin/cloudflared
+    - |
+      TUNNEL_SERVICE_TOKEN_ID="$CF_ACCESS_CLIENT_ID" TUNNEL_SERVICE_TOKEN_SECRET="$CF_ACCESS_CLIENT_SECRET" \
+        cloudflared access tcp --hostname "$KUBE_API_HOSTNAME" --url 127.0.0.1:16443 >/tmp/cloudflared.log 2>&1 &
+      for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/16443) 2>/dev/null && break; sleep 0.5; done
+    - export KUBECONFIG="$KUBECONFIG_JMUSICBOT"
+    - scripts/assert-kube-target.sh home
+
+# ---------------------------------------------------------------------------
+# prepare: resolve upstream, apply homelab patches, run the test suite.
+# Also runs on MRs, so a patch that no longer applies fails *before* merge.
+# ---------------------------------------------------------------------------
+prepare-bot:
+  stage: prepare
+  extends: .bot-rules
+  image: maven:3-eclipse-temurin-25
+  variables:
+    MAVEN_OPTS: -Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository
+  cache:
+    key: maven-repo
+    paths: [.m2/repository]
+  script:
+    - command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git >/dev/null)
+    - ref="${UPSTREAM_REF:-$(scripts/latest-tag.sh arif-banai/MusicBot)}"
+    - git clone --depth 1 --branch "$ref" https://github.com/arif-banai/MusicBot.git musicbot
+    - |
+      grep -vE '^[[:space:]]*(#|$)' patches/series | while read -r p; do
+        echo "applying $p"
+        git -C musicbot apply "$CI_PROJECT_DIR/patches/$p"
+      done
+    - yts="$(scripts/latest-tag.sh lavalink-devs/youtube-source)"; yts="${yts#v}"
+    - sed -i "s|<youtube-source.version>[^<]*</youtube-source.version>|<youtube-source.version>${yts}</youtube-source.version>|" musicbot/pom.xml
+    - mvn -q -B -f musicbot/pom.xml test
+    # dotenv report = GitHub's $GITHUB_OUTPUT: every later job that `needs`
+    # this one gets these as plain environment variables.
+    - |
+      {
+        echo "IMAGE_TAG=upstream-${ref#v}-${CI_COMMIT_SHA:0:12}"
+        echo "UPSTREAM_REF_RESOLVED=$ref"
+        echo "YOUTUBE_SOURCE_VERSION=$yts"
+      } | tee build.env
+  artifacts:
+    expire_in: 1 day
+    paths: [musicbot/]
+    exclude: [musicbot/target/**/*, musicbot/.git/**/*]
+    reports:
+      dotenv: build.env
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+build-bot:
+  stage: build
+  extends: [.buildx, .bot-publish-rules]
+  needs: [prepare-bot]
+  script:
+    - |
+      docker buildx build musicbot \
+        --platform linux/amd64,linux/arm64 \
+        --cache-from "type=registry,ref=${BOT_IMAGE}:buildcache" \
+        --cache-to "type=registry,ref=${BOT_IMAGE}:buildcache,mode=max" \
+        --tag "${BOT_IMAGE}:${IMAGE_TAG}" \
+        --tag "${BOT_IMAGE}:latest" \
+        --push
+    # A single-arch image would ImagePullBackOff on whichever node it's missing.
+    - |
+      out="$(docker buildx imagetools inspect "${BOT_IMAGE}:${IMAGE_TAG}")"
+      echo "$out"
+      for plat in linux/amd64 linux/arm64; do
+        echo "$out" | grep -qE "Platform:[[:space:]]+$plat" || { echo "image is missing $plat" >&2; exit 1; }
+      done
+
+build-notifier:
+  stage: build
+  extends: .buildx
+  needs: []
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - changes: [release-notifier/**/*, .gitlab-ci.yml]
+  script:
+    - |
+      docker buildx build release-notifier \
+        --platform linux/amd64,linux/arm64 \
+        --tag "${NOTIFIER_IMAGE}:${CI_COMMIT_SHORT_SHA}" \
+        --tag "${NOTIFIER_IMAGE}:latest" \
+        --push
+
+# ---------------------------------------------------------------------------
+# deploy -> verify -> rollback
+# ---------------------------------------------------------------------------
+deploy:
+  stage: deploy
+  extends: [.kube, .deploy-rules]
+  needs: [prepare-bot, build-bot]
+  environment:
+    name: production
+    deployment_tier: production
+  script:
+    - echo "APPLIED=false" > deploy.env
+    - kubectl get deployment/jmusicbot -n jmusicbot
+    # Exit 3 = another site holds the witness lease: skip, don't fail.
+    - |
+      set +e; scripts/assert-jmusicbot-home-owner.sh; rc=$?; set -e
+      if [ "$rc" -eq 3 ]; then
+        echo "Home does not own the jmusicbot lease -- deployment skipped."
+        exit 0
+      fi
+      [ "$rc" -eq 0 ] || exit "$rc"
+    - kubectl set image deployment/jmusicbot jmusicbot="${BOT_IMAGE}:${IMAGE_TAG}" -n jmusicbot
+    - echo "APPLIED=true" > deploy.env
+    # set image already triggers the Recreate rollout; no extra restart (the
+    # new pod is expected NotReady while it reconnects to Discord).
+  artifacts:
+    when: always
+    reports:
+      dotenv: deploy.env
+
+# verify/rollback use the same inclusion conditions as deploy (minus the
+# manual gate) -- a job whose `needs:` names an absent job fails pipeline
+# creation outright.
+verify:
+  stage: verify
+  extends: .kube
+  needs: [prepare-bot, deploy]
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|schedule)$/
+    - changes: *bot-paths
+  script:
+    - |
+      if [ "${APPLIED:-false}" != "true" ]; then echo "Nothing was applied -- skipping verify."; exit 0; fi
+    - kubectl rollout status deployment/jmusicbot -n jmusicbot --timeout=180s
+    - |
+      pod="$(kubectl get pod -n jmusicbot -l app.kubernetes.io/name=jmusicbot \
+        -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+      test -n "$pod"
+      ready="$(kubectl get pod "$pod" -n jmusicbot -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
+      image="$(kubectl get pod "$pod" -n jmusicbot -o jsonpath='{.spec.containers[?(@.name=="jmusicbot")].image}')"
+      echo "pod=$pod ready=$ready image=$image"
+      test "$ready" = True
+      case "$image" in *":${IMAGE_TAG}") ;; *) echo "unexpected image: $image" >&2; exit 1 ;; esac
+
+rollback:
+  stage: rollback
+  extends: .kube
+  needs: [deploy, verify]
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|schedule)$/
+      when: on_failure
+    - changes: *bot-paths
+      when: on_failure
+  script:
+    # Only undo a rollout this pipeline actually made; a failure before
+    # `set image` must not roll the cluster back to an older ReplicaSet.
+    - |
+      if [ "${APPLIED:-false}" != "true" ]; then echo "deploy never changed the image -- nothing to roll back."; exit 0; fi
+    - kubectl rollout undo deployment/jmusicbot -n jmusicbot
+    - kubectl rollout status deployment/jmusicbot -n jmusicbot --timeout=180s
