@@ -1,0 +1,218 @@
+diff --git a/Dockerfile b/Dockerfile
+index 76616ea..a0d43ab 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -46,10 +46,11 @@ FROM eclipse-temurin:25-jdk-noble AS jre-builder
+ #   java.security.jgss - Kerberos/GSS-API security
+ #   java.sql          - JDBC (used by some dependencies)
+ #   jdk.crypto.ec     - Elliptic curve crypto for TLS/SSL (Discord API) - runtime loaded
++#   jdk.httpserver    - com.sun.net.httpserver.HttpServer (health endpoint)
+ #   jdk.management    - JMX management extensions
+ #   jdk.unsupported   - Native library access (jdave, udpqueue)
+ RUN $JAVA_HOME/bin/jlink \
+-    --add-modules java.base,java.compiler,java.desktop,java.logging,java.naming,java.net.http,java.scripting,java.security.jgss,java.sql,jdk.crypto.ec,jdk.management,jdk.unsupported \
++    --add-modules java.base,java.compiler,java.desktop,java.logging,java.naming,java.net.http,java.scripting,java.security.jgss,java.sql,jdk.crypto.ec,jdk.httpserver,jdk.management,jdk.unsupported \
+     --strip-debug \
+     --no-man-pages \
+     --no-header-files \
+diff --git a/src/main/java/com/jagrosh/jmusicbot/Bot.java b/src/main/java/com/jagrosh/jmusicbot/Bot.java
+index 177a401..60847e8 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/Bot.java
++++ b/src/main/java/com/jagrosh/jmusicbot/Bot.java
+@@ -65,6 +65,7 @@ public class Bot
+     private JDA jda;
+     private JFrame gui;
+     private CommandClient commandClient;
++    private HealthServer healthServer;
+     
+     public Bot(EventWaiter waiter, BotConfig config, SettingsManager settings, UserInteraction userInteraction)
+     {
+@@ -259,6 +260,16 @@ public class Bot
+         return commandClient;
+     }
+ 
++    public HealthServer getHealthServer()
++    {
++        return healthServer;
++    }
++
++    public void setHealthServer(HealthServer healthServer)
++    {
++        this.healthServer = healthServer;
++    }
++
+     public YoutubeOauth2TokenHandler getYouTubeOauth2Handler() {
+         return youTubeOauth2TokenHandler;
+     }
+diff --git a/src/main/java/com/jagrosh/jmusicbot/HealthServer.java b/src/main/java/com/jagrosh/jmusicbot/HealthServer.java
+new file mode 100644
+index 0000000..af51c74
+--- /dev/null
++++ b/src/main/java/com/jagrosh/jmusicbot/HealthServer.java
+@@ -0,0 +1,120 @@
++/*
++ * Copyright 2026
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.jagrosh.jmusicbot;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.concurrent.Executors;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++/**
++ * Minimal HTTP health endpoint for the container so the kubelet probes and
++ * the in-cluster watcher has something to check.
++ *
++ * <p>Deliberately dependency-free: it uses the JDK's built-in
++ * {@code com.sun.net.httpserver.HttpServer} rather than pulling in an HTTP
++ * framework. The image's jlink runtime must therefore include the
++ * {@code jdk.httpserver} module (see the Dockerfile).
++ *
++ * <p>Routes:
++ * <ul>
++ *   <li>{@code GET /health} (and alias {@code /healthz}) — {@code 200
++ *       {"status":"ok"}} once the bot has logged into Discord, otherwise
++ *       {@code 503 {"status":"starting"}}. Used by the readiness probe and by
++ *       Uptime Kuma.</li>
++ *   <li>{@code GET /live} — {@code 200 {"status":"alive"}} whenever this server
++ *       is bound, i.e. whenever the JVM is alive. Used by the liveness probe so
++ *       the kubelet never restarts the pod just because Discord is unreachable
++ *       or the login is slow.</li>
++ * </ul>
++ */
++public class HealthServer {
++
++    private static final Logger LOG = LoggerFactory.getLogger(HealthServer.class);
++
++    /** Port the health endpoint listens on. Keep in sync with the Deployment and Service. */
++    public static final int DEFAULT_PORT = 9091;
++
++    private final int port;
++    private final AtomicBoolean ready = new AtomicBoolean(false);
++    private HttpServer server;
++
++    public HealthServer() {
++        this(DEFAULT_PORT);
++    }
++
++    public HealthServer(int port) {
++        this.port = port;
++    }
++
++    /**
++     * Binds the listener. Safe to call once at startup; failure to bind is
++     * logged, not fatal — the bot can still run, it just can't be health-checked.
++     */
++    public void start() {
++        try {
++            server = HttpServer.create(new InetSocketAddress(port), 0);
++            server.createContext("/health", this::handleHealth);
++            server.createContext("/healthz", this::handleHealth);
++            server.createContext("/live", this::handleLive);
++            server.setExecutor(Executors.newCachedThreadPool());
++            server.start();
++            LOG.info("Health HTTP server listening on port {}", port);
++        }
++        catch (IOException e) {
++            LOG.error("Could not start health HTTP server on port {}", port, e);
++        }
++    }
++
++    /**
++     * Flips the ready state. Called from {@code StartupLifecycleListener.onReady}
++     * once the Discord session is actually ready.
++     */
++    public void setReady(boolean ready) {
++        this.ready.set(ready);
++    }
++
++    public boolean isReady() {
++        return ready.get();
++    }
++
++    private void handleHealth(HttpExchange exchange) throws IOException {
++        boolean isReady = ready.get();
++        respond(exchange,
++                isReady ? 200 : 503,
++                isReady ? "{\"status\":\"ok\"}" : "{\"status\":\"starting\"}");
++    }
++
++    private void handleLive(HttpExchange exchange) throws IOException {
++        respond(exchange, 200, "{\"status\":\"alive\"}");
++    }
++
++    private void respond(HttpExchange exchange, int status, String body) throws IOException {
++        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
++        exchange.getResponseHeaders().set("Content-Type", "application/json");
++        exchange.sendResponseHeaders(status, bytes.length);
++        try (OutputStream os = exchange.getResponseBody()) {
++            os.write(bytes);
++        }
++    }
++}
+diff --git a/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java b/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java
+index 105f4a6..0e3ce9b 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java
++++ b/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java
+@@ -191,6 +191,15 @@ public class JMusicBot
+         SettingsManager settings = new SettingsManager();
+         Bot bot = new Bot(waiter, config, settings, userInteraction);
+ 
++        // Health HTTP endpoint: bind /live + /health on a
++        // dedicated port so the kubelet probes and Uptime Kuma have something to
++        // check. /live is up as soon as the server binds; /health only returns 200
++        // once StartupLifecycleListener sees the Discord ReadyEvent. Deliberately
++        // no external HTTP library -- com.sun.net.httpserver is part of the JDK.
++        HealthServer healthServer = new HealthServer();
++        healthServer.start();
++        bot.setHealthServer(healthServer);
++
+         // TrackLoadingMonitor is configured via Bot.getAudioLoadWrapper() (DI pattern).
+         VoiceConnectionMonitor.setEnabled(guiEnabled);
+ 
+diff --git a/src/main/java/com/jagrosh/jmusicbot/listener/StartupLifecycleListener.java b/src/main/java/com/jagrosh/jmusicbot/listener/StartupLifecycleListener.java
+index a0630e8..63e5fb0 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/listener/StartupLifecycleListener.java
++++ b/src/main/java/com/jagrosh/jmusicbot/listener/StartupLifecycleListener.java
+@@ -16,6 +16,7 @@
+ package com.jagrosh.jmusicbot.listener;
+ 
+ import com.jagrosh.jmusicbot.Bot;
++import com.jagrosh.jmusicbot.HealthServer;
+ import com.jagrosh.jmusicbot.JMusicBot;
+ import com.jagrosh.jmusicbot.commands.SlashCommandRegistry;
+ import com.jagrosh.jmusicbot.entities.UserInteraction.Level;
+@@ -51,6 +52,13 @@ public class StartupLifecycleListener extends ListenerAdapter {
+ 
+     @Override
+     public void onReady(ReadyEvent event) {
++        // Mark the health endpoint ready only once Discord has actually logged in
++        // Guarded because tests construct this listener with
++        // a mocked Bot that has no HealthServer attached.
++        if (bot.getHealthServer() != null) {
++            bot.getHealthServer().setReady(true);
++        }
++
+         if (event.getJDA().getGuildCache().isEmpty()) {
+             Logger log = LoggerFactory.getLogger("MusicBot");
+             String inviteUrl = event.getJDA().getInviteUrl(JMusicBot.RECOMMENDED_PERMS);

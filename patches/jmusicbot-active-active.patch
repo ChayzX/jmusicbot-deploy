@@ -1,0 +1,287 @@
+diff --git a/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java b/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java
+index a82b18f..bfb6fe5 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java
++++ b/src/main/java/com/jagrosh/jmusicbot/JMusicBot.java
+@@ -30,6 +30,8 @@ import com.jagrosh.jmusicbot.utils.OtherUtil;
+ import com.jagrosh.jmusicbot.utils.TeeOutputStream;
+ 
+ import java.io.PrintStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
+ import net.dv8tion.jda.api.JDA;
+ import net.dv8tion.jda.api.Permission;
+ import net.dv8tion.jda.api.exceptions.ErrorResponseException;
+@@ -44,6 +46,7 @@ import org.slf4j.LoggerFactory;
+  */
+ public class JMusicBot 
+ {
++    private static final Path OWNERSHIP_MARKER = Path.of("/musicbot/.jmusicbot-lease-owner");
+     public final static Logger LOG = LoggerFactory.getLogger(JMusicBot.class);
+     public final static Permission[] RECOMMENDED_PERMS = {
+             Permission.VIEW_CHANNEL,
+@@ -200,6 +203,32 @@ public class JMusicBot
+         healthServer.start();
+         bot.setHealthServer(healthServer);
+ 
++        WitnessOwnership ownership;
++        try
++        {
++            ownership = WitnessOwnership.fromEnvironment();
++            WitnessOwnership.Lease lease = null;
++            while (lease == null)
++            {
++                lease = ownership.acquire();
++                if (lease == null)
++                {
++                    LOG.info("JMusicBot witness lease is held by another site; retrying in 5 seconds");
++                    Thread.sleep(5000);
++                }
++            }
++            LOG.info("JMusicBot witness lease acquired: site={} resource={} epoch={}",
++                    lease.site(), System.getenv().getOrDefault("JMUSICBOT_WITNESS_RESOURCE", "jmusicbot"), lease.epoch());
++            Files.writeString(OWNERSHIP_MARKER, lease.site() + ":" + lease.epoch());
++        }
++        catch (Exception error)
++        {
++            LOG.error("JMusicBot cannot obtain its Discord side-effect lease", error);
++            InstanceLock.release();
++            System.exit(1);
++            return;
++        }
++
+         // TrackLoadingMonitor is configured via Bot.getAudioLoadWrapper() (DI pattern).
+         VoiceConnectionMonitor.setEnabled(guiEnabled);
+ 
+@@ -230,6 +259,19 @@ public class JMusicBot
+         {
+             JDA jda = DiscordService.createJDA(config, bot, waiter, client, userInteraction);
+             bot.setJDA(jda);
++            ownership.start(() -> {
++                LOG.error("JMusicBot witness lease lost; shutting down Discord before another site can take ownership");
++                try
++                {
++                    Files.deleteIfExists(OWNERSHIP_MARKER);
++                }
++                catch (Exception error)
++                {
++                    LOG.warn("Could not remove the JMusicBot ownership marker", error);
++                }
++                healthServer.setReady(false);
++                bot.shutdown();
++            });
+         }
+         catch(IllegalArgumentException ex)
+         {
+diff --git a/src/main/java/com/jagrosh/jmusicbot/WitnessOwnership.java b/src/main/java/com/jagrosh/jmusicbot/WitnessOwnership.java
+new file mode 100644
+index 0000000..cab7655
+--- /dev/null
++++ b/src/main/java/com/jagrosh/jmusicbot/WitnessOwnership.java
+@@ -0,0 +1,207 @@
++package com.jagrosh.jmusicbot;
++
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Clock;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/** Resource-scoped witness lease that gates the Discord connection. */
++final class WitnessOwnership {
++    private static final Pattern STRING_FIELD = Pattern.compile("\\\"%s\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
++    private static final Pattern LONG_FIELD = Pattern.compile("\\\"%s\\\"\\s*:\\s*(\\d+)");
++    private static final Pattern BOOLEAN_FIELD = Pattern.compile("\\\"%s\\\"\\s*:\\s*(true|false)");
++    private static final int REQUEST_TIMEOUT_SECONDS = 5;
++    private static final int RENEW_ATTEMPTS = 2;
++    private static final int RETRY_SECONDS = 5;
++
++    record Lease(String site, long epoch, long expiresAtMillis, String token) {}
++
++    private final URI baseUri;
++    private final String secret;
++    private final String site;
++    private final String resource;
++    private final int leaseSeconds;
++    private final HttpClient httpClient;
++    private final Clock clock;
++    private final AtomicBoolean fenced = new AtomicBoolean(true);
++    private volatile Lease lease;
++    private ScheduledExecutorService renewal;
++
++    static WitnessOwnership fromEnvironment() {
++        String site = required("JMUSICBOT_SITE");
++        if (!site.equals("home") && !site.equals("oracle"))
++            throw new IllegalStateException("JMUSICBOT_SITE must be exactly home or oracle");
++        String url = required("JMUSICBOT_WITNESS_URL").replaceAll("/$", "");
++        String secret = required("JMUSICBOT_WITNESS_SECRET");
++        int leaseSeconds;
++        try {
++            leaseSeconds = Integer.parseInt(System.getenv().getOrDefault("JMUSICBOT_LEASE_SECONDS", "30"));
++        } catch (NumberFormatException error) {
++            throw new IllegalStateException("JMUSICBOT_LEASE_SECONDS must be an integer", error);
++        }
++        if (leaseSeconds < 3)
++            throw new IllegalStateException("JMUSICBOT_LEASE_SECONDS must be at least 3");
++        return new WitnessOwnership(url, secret, site,
++                System.getenv().getOrDefault("JMUSICBOT_WITNESS_RESOURCE", "jmusicbot"),
++                leaseSeconds, HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build(), Clock.systemUTC());
++    }
++
++    WitnessOwnership(String baseUrl, String secret, String site, String resource,
++                      int leaseSeconds, HttpClient httpClient, Clock clock) {
++        this.baseUri = URI.create(baseUrl);
++        this.secret = secret;
++        this.site = site;
++        this.resource = resource;
++        this.leaseSeconds = leaseSeconds;
++        this.httpClient = httpClient;
++        this.clock = clock;
++    }
++
++    /** Returns null for a competing owner; callers may retry without opening Discord. */
++    Lease acquire() throws IOException, InterruptedException {
++        HttpResponse<String> response = post("/v1/authority/acquire",
++                "{\"site\":\"" + escape(site) + "\",\"resource\":\"" + escape(resource) + "\"}");
++        if (response.statusCode() == 409)
++            return null;
++        if (response.statusCode() < 200 || response.statusCode() >= 300)
++            throw new IOException("witness acquire HTTP " + response.statusCode());
++        Lease acquired = parseLease(response.body());
++        lease = acquired;
++        fenced.set(false);
++        return acquired;
++    }
++
++    boolean renewOnce() {
++        Lease current = lease;
++        if (current == null || !isValid()) {
++            System.err.printf("JMusicBot witness renewal skipped: leasePresent=%s fenced=%s expiresInMillis=%d%n",
++                    current != null, fenced.get(), current == null ? 0 : current.expiresAtMillis() - now());
++            fence();
++            return false;
++        }
++        String body = "{\"site\":\"" + escape(site) + "\",\"resource\":\"" + escape(resource)
++                + "\",\"epoch\":" + current.epoch() + ",\"token\":\""
++                + escape(current.token()) + "\"}";
++        for (int attempt = 1; attempt <= RENEW_ATTEMPTS; attempt++) {
++            try {
++                HttpResponse<String> response = post("/v1/authority/renew", body);
++                if (response.statusCode() != 200 || !booleanField(response.body(), "ok")) {
++                    System.err.printf("JMusicBot witness renewal rejected: HTTP %d body=%s%n",
++                            response.statusCode(), response.body());
++                    fence();
++                    return false;
++                }
++                lease = new Lease(current.site(), current.epoch(), now() + leaseSeconds * 1000L, current.token());
++                return true;
++            } catch (IOException error) {
++                System.err.printf("JMusicBot witness renewal transport failure attempt=%d/%d: %s: %s%n",
++                        attempt, RENEW_ATTEMPTS, error.getClass().getSimpleName(), error.getMessage());
++                if (attempt == RENEW_ATTEMPTS || current.expiresAtMillis() <= now()) {
++                    fence();
++                    return false;
++                }
++            } catch (InterruptedException error) {
++                Thread.currentThread().interrupt();
++                fence();
++                return false;
++            }
++        }
++        fence();
++        return false;
++    }
++
++    boolean isValid() {
++        Lease current = lease;
++        return !fenced.get() && current != null && current.expiresAtMillis() > now();
++    }
++
++    void start(Runnable onLost) {
++        renewal = Executors.newSingleThreadScheduledExecutor(r -> {
++            Thread thread = new Thread(r, "jmusicbot-witness-renewal");
++            thread.setDaemon(true);
++            return thread;
++        });
++        long period = Math.max(1, leaseSeconds / 3);
++        renewal.scheduleAtFixedRate(() -> {
++            if (!renewOnce()) {
++                onLost.run();
++                stop();
++            }
++        }, period, period, TimeUnit.SECONDS);
++    }
++
++    void stop() {
++        if (renewal != null) {
++            renewal.shutdownNow();
++            renewal = null;
++        }
++    }
++
++    private void fence() {
++        fenced.set(true);
++    }
++
++    private HttpResponse<String> post(String path, String body) throws IOException, InterruptedException {
++        HttpRequest request = HttpRequest.newBuilder(baseUri.resolve(path))
++                .version(HttpClient.Version.HTTP_1_1)
++                .timeout(java.time.Duration.ofSeconds(REQUEST_TIMEOUT_SECONDS))
++                .header("Authorization", "Bearer " + secret)
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(body))
++                .build();
++        // The site-local relay closes each HTTP response. Use a fresh client so
++        // Java cannot reuse a stale pooled connection on the next renewal.
++        return HttpClient.newBuilder()
++                .version(HttpClient.Version.HTTP_1_1)
++                .build()
++                .send(request, HttpResponse.BodyHandlers.ofString());
++    }
++
++    private Lease parseLease(String body) throws IOException {
++        String responseSite = stringField(body, "site");
++        long epoch = longField(body, "epoch");
++        String token = stringField(body, "token");
++        if (!site.equals(responseSite) || epoch < 1 || token.length() < 16)
++            throw new IOException("invalid witness lease response");
++        return new Lease(responseSite, epoch, now() + leaseSeconds * 1000L, token);
++    }
++
++    private static String required(String name) {
++        String value = System.getenv(name);
++        if (value == null || value.isBlank())
++            throw new IllegalStateException(name + " is required");
++        return value;
++    }
++
++    private long now() { return clock.millis(); }
++
++    private static String escape(String value) { return value.replace("\\", "\\\\").replace("\"", "\\\""); }
++
++    private static String stringField(String body, String name) throws IOException {
++        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(name)
++                + "\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").matcher(body);
++        if (!matcher.find()) throw new IOException("missing witness field " + name);
++        return matcher.group(1);
++    }
++
++    private static long longField(String body, String name) throws IOException {
++        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(name)
++                + "\\\"\\s*:\\s*(\\d+)").matcher(body);
++        if (!matcher.find()) throw new IOException("missing witness field " + name);
++        return Long.parseLong(matcher.group(1));
++    }
++
++    private static boolean booleanField(String body, String name) {
++        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(name)
++                + "\\\"\\s*:\\s*(true|false)").matcher(body);
++        return matcher.find() && Boolean.parseBoolean(matcher.group(1));
++    }
++}

@@ -1,5 +1,12 @@
 # JMusicBot Deploy — Instructions for Claude Code
 
+> **Current state (2026-09):** JMusicBot now runs on the k3s cluster, deployed
+> from `chayzx/k8s-homelab` (`jmusicbot/` manifests +
+> `.github/workflows/jmusicbot-deploy.yml`). The Docker Desktop / Watchtower
+> steps below describe the retired single-host setup. This repo is also the
+> **GitLab CI pilot** for that deploy path. Read `GITLAB-PILOT.md` before
+> changing `.gitlab-ci.yml`, `patches/`, or `scripts/`.
+
 ## Goal
 Deploy arif-banai/MusicBot (a fork of JMusicBot) as its own isolated Docker
 pod on this Ubuntu machine, auto-starting on boot via systemd, and

@@ -1,0 +1,678 @@
+diff --git a/src/main/java/com/jagrosh/jmusicbot/audio/NowPlayingHandler.java b/src/main/java/com/jagrosh/jmusicbot/audio/NowPlayingHandler.java
+index 058e49ef7..bc7f2912b 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/audio/NowPlayingHandler.java
++++ b/src/main/java/com/jagrosh/jmusicbot/audio/NowPlayingHandler.java
+@@ -24,6 +24,7 @@
+ import net.dv8tion.jda.api.entities.Guild;
+ import net.dv8tion.jda.api.entities.Message;
+ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
++import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+ import net.dv8tion.jda.api.exceptions.ErrorResponseException;
+ import net.dv8tion.jda.api.requests.ErrorResponse;
+ import net.dv8tion.jda.api.utils.messages.MessageCreateData;
+@@ -230,7 +231,7 @@ private void reconcile(long guildId, long reconcileVersion)
+             return;
+         }
+ 
+-        TextChannel tc = guild.getTextChannelById(loc.channelId());
++        GuildMessageChannel tc = resolveMessageChannel(guild, loc.channelId());
+         if (tc == null)
+         {
+             synchronized (state)
+@@ -274,13 +275,13 @@ private void reconcile(long guildId, long reconcileVersion)
+     private void sendPlayingMessage(long guildId, Guild guild, AudioTrack currentTrack, NPLocation previousLocation,
+                                     MessageCreateData msg, long reconcileVersion)
+     {
+-        TextChannel tc;
++        GuildMessageChannel tc;
+         if(previousLocation == null)
+         {
+             if (currentTrack.getUserData(RequestMetadata.class) != null)
+             {
+                 long channelId = currentTrack.getUserData(RequestMetadata.class).channelId;
+-                tc = guild.getTextChannelById(channelId);
++                tc = resolveMessageChannel(guild, channelId);
+             }
+             else
+             {
+@@ -289,7 +290,7 @@ private void sendPlayingMessage(long guildId, Guild guild, AudioTrack currentTra
+         }
+         else
+         {
+-            tc = guild.getTextChannelById(previousLocation.channelId());
++            tc = resolveMessageChannel(guild, previousLocation.channelId());
+         }
+ 
+         if (tc == null)
+@@ -353,6 +354,18 @@ private TextChannel resolveFallbackChannel(Guild guild)
+         return commandChannel;
+     }
+ 
++    /**
++     * Resolves any guild channel that can receive messages, including a voice
++     * channel's built-in text chat.
++     */
++    private GuildMessageChannel resolveMessageChannel(Guild guild, long channelId)
++    {
++        GuildMessageChannel channel = guild.getChannelById(GuildMessageChannel.class, channelId);
++        if (channel != null)
++            return channel;
++        return guild.getTextChannelById(channelId);
++    }
++
+     private void notifyOwnerMissingCommandChannel(Guild guild, String reason)
+     {
+         long guildId = guild.getIdLong();
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/MusicCommandValidator.java b/src/main/java/com/jagrosh/jmusicbot/commands/MusicCommandValidator.java
+index df8d39ea8..0edcbe5d3 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/MusicCommandValidator.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/MusicCommandValidator.java
+@@ -10,6 +10,7 @@
+ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
+ import net.dv8tion.jda.api.entities.channel.concrete.VoiceChannel;
+ import net.dv8tion.jda.api.entities.channel.middleman.AudioChannel;
++import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+ import net.dv8tion.jda.api.exceptions.PermissionException;
+ 
+ /**
+@@ -36,7 +37,7 @@ public interface ErrorHandler
+      *
+      * @param guild         The guild where the command was invoked
+      * @param member        The member who invoked the command
+-     * @param textChannel   The text channel where the command was invoked
++     * @param commandChannel The message-capable guild channel where the command was invoked
+      * @param settings      The guild settings
+      * @param bot           The bot instance
+      * @param jda           The JDA instance (for checking if music is playing)
+@@ -45,14 +46,14 @@ public interface ErrorHandler
+      * @param errorHandler  Callback for error messages
+      * @return true if validation passed, false if an error was sent
+      */
+-    public static boolean validate(Guild guild, Member member, TextChannel textChannel,
++    public static boolean validate(Guild guild, Member member, GuildMessageChannel commandChannel,
+                                    Settings settings, Bot bot, JDA jda,
+                                    boolean bePlaying, boolean beListening,
+                                    ErrorHandler errorHandler)
+     {
+         // Check text channel restriction
+         TextChannel requiredChannel = settings.getTextChannel(guild);
+-        if (requiredChannel != null && !textChannel.equals(requiredChannel))
++        if (requiredChannel != null && !commandChannel.equals(requiredChannel))
+         {
+             errorHandler.onTextChannelError(requiredChannel);
+             return false;
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v1/MusicCommand.java b/src/main/java/com/jagrosh/jmusicbot/commands/v1/MusicCommand.java
+index 4037906c3..88c1c37d1 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v1/MusicCommand.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v1/MusicCommand.java
+@@ -50,7 +50,7 @@ protected void execute(CommandEvent event)
+         boolean valid = MusicCommandValidator.validate(
+                 event.getGuild(),
+                 event.getMember(),
+-                event.getTextChannel(),
++                event.getGuildChannel(),
+                 settings,
+                 bot,
+                 event.getJDA(),
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v1/dj/PlaynextCmd.java b/src/main/java/com/jagrosh/jmusicbot/commands/v1/dj/PlaynextCmd.java
+index fc45ead75..a22b19e4b 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v1/dj/PlaynextCmd.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v1/dj/PlaynextCmd.java
+@@ -57,7 +57,7 @@ public void doCommand(CommandEvent event)
+                 : event.getArgs().isEmpty() ? event.getMessage().getAttachments().get(0).getUrl() : event.getArgs();
+ 
+         event.reply(loadingEmoji + " Loading... `[" + args + "]`", m ->
+-                musicService.playNext(event.getGuild(), event.getMember(), args, event.getTextChannel(),
++                musicService.playNext(event.getGuild(), event.getMember(), args, event.getGuildChannel(),
+                         new MessageEditOutputAdapter(m)));
+     }
+ }
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v1/music/PlayCmd.java b/src/main/java/com/jagrosh/jmusicbot/commands/v1/music/PlayCmd.java
+index f5e1ac016..5180e50a1 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v1/music/PlayCmd.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v1/music/PlayCmd.java
+@@ -58,13 +58,13 @@ public void doCommand(CommandEvent event)
+ 
+         if (args.isEmpty())
+         {
+-            musicService.play(event.getGuild(), event.getMember(), args, event.getTextChannel(),
++            musicService.play(event.getGuild(), event.getMember(), args, event.getGuildChannel(),
+                     new CommandEventOutputAdapter(event, name, children));
+             return;
+         }
+ 
+         event.reply(loadingEmoji + " Loading... `[" + args + "]`", m -> {
+-            musicService.play(event.getGuild(), event.getMember(), args, event.getTextChannel(),
++            musicService.play(event.getGuild(), event.getMember(), args, event.getGuildChannel(),
+                     new MessageEditOutputAdapter(m));
+         });
+     }
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v1/owner/DebugCmd.java b/src/main/java/com/jagrosh/jmusicbot/commands/v1/owner/DebugCmd.java
+index 6b92358e4..4a0d8fc86 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v1/owner/DebugCmd.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v1/owner/DebugCmd.java
+@@ -36,7 +36,6 @@
+ import net.dv8tion.jda.api.JDAInfo;
+ import net.dv8tion.jda.api.Permission;
+ import net.dv8tion.jda.api.entities.channel.ChannelType;
+-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
+ import net.dv8tion.jda.api.utils.FileUpload;
+ 
+ /**
+@@ -84,7 +83,7 @@ protected void execute(CommandEvent event)
+         sb.append("```");
+ 
+         if (event.isFromType(ChannelType.PRIVATE)
+-                || event.getSelfMember().hasPermission((TextChannel) event.getChannel(), Permission.MESSAGE_ATTACH_FILES))
++                || event.getSelfMember().hasPermission(event.getGuildChannel(), Permission.MESSAGE_ATTACH_FILES))
+             event.getChannel().sendFiles(FileUpload.fromData(sb.toString().getBytes(), "debug_information.txt")).queue();
+         else
+             event.reply("Debug Information: " + sb.toString());
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v2/MusicSlashCommand.java b/src/main/java/com/jagrosh/jmusicbot/commands/v2/MusicSlashCommand.java
+index 06a2020b4..e40b25859 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v2/MusicSlashCommand.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v2/MusicSlashCommand.java
+@@ -30,7 +30,7 @@ protected void execute(SlashCommandEvent event)
+         boolean valid = MusicCommandValidator.validate(
+                 event.getGuild(),
+                 event.getMember(),
+-                event.getTextChannel(),
++                event.getGuildChannel(),
+                 settings,
+                 bot,
+                 event.getJDA(),
+@@ -83,4 +83,4 @@ public void onVoiceConnectError(AudioChannel channel)
+     }
+ 
+     public abstract void doCommand(SlashCommandEvent event);
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v2/dj/PlaynextSlashCmd.java b/src/main/java/com/jagrosh/jmusicbot/commands/v2/dj/PlaynextSlashCmd.java
+index af48306a1..4d4534777 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v2/dj/PlaynextSlashCmd.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v2/dj/PlaynextSlashCmd.java
+@@ -55,7 +55,7 @@ public void doDJCommand(SlashCommandEvent event)
+ 
+         event.reply(loadingEmoji + " Loading... `[" + query + "]`").queue(hook ->
+         {
+-            musicService.playNext(event.getGuild(), event.getMember(), query, event.getTextChannel(),
++            musicService.playNext(event.getGuild(), event.getMember(), query, event.getGuildChannel(),
+                     new InteractionHookOutputAdapter(hook, event.getJDA(), event.getClient().getWarning()));
+         });
+     }
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/PlaySlashCmd.java b/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/PlaySlashCmd.java
+index 31aa7fa58..499873a83 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/PlaySlashCmd.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/PlaySlashCmd.java
+@@ -42,14 +42,14 @@ public void doCommand(SlashCommandEvent event)
+     {
+         if (event.getOption("query") == null)
+         {
+-            musicService.play(event.getGuild(), event.getMember(), "", event.getTextChannel(),
++            musicService.play(event.getGuild(), event.getMember(), "", event.getGuildChannel(),
+                     new SlashEventOutputAdapter(event));
+             return;
+         }
+ 
+         String args = event.getOption("query").getAsString();
+         event.reply(loadingEmoji + " Loading... `[" + args + "]`").queue(hook -> {
+-            musicService.play(event.getGuild(), event.getMember(), args, event.getTextChannel(),
++            musicService.play(event.getGuild(), event.getMember(), args, event.getGuildChannel(),
+                     new InteractionHookOutputAdapter(hook, event.getJDA(), event.getClient().getWarning()));
+         });
+     }
+diff --git a/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/SearchSlashCmd.java b/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/SearchSlashCmd.java
+index 58896fcf6..e4a42bf16 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/SearchSlashCmd.java
++++ b/src/main/java/com/jagrosh/jmusicbot/commands/v2/music/SearchSlashCmd.java
+@@ -67,7 +67,7 @@ public void doCommand(SlashCommandEvent event)
+         event.reply(searchingEmoji + " Searching " + searchPlatform + " for `" + query + "`...").queue(hook ->
+         {
+             bot.getSearchService().search(event.getGuild(), event.getMember(), query, searchPrefix,
+-                    event.getTextChannel(), new SearchService.SearchCallback()
++                    event.getGuildChannel(), new SearchService.SearchCallback()
+                     {
+                         @Override
+                         public void onTrackLoaded(AudioTrack track, int queuePosition, String formattedMessage)
+@@ -153,7 +153,7 @@ public void onSearchResults(AudioPlaylist playlist, String[] formattedChoices)
+                                                                 event.getMember(),
+                                                                 selectedTrack,
+                                                                 query,
+-                                                                event.getTextChannel()
++                                                                event.getGuildChannel()
+                                                         );
+ 
+                                                         if (result != null)
+diff --git a/src/main/java/com/jagrosh/jmusicbot/listener/HistoryInteractionListener.java b/src/main/java/com/jagrosh/jmusicbot/listener/HistoryInteractionListener.java
+index 684ad6e38..bece97d8f 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/listener/HistoryInteractionListener.java
++++ b/src/main/java/com/jagrosh/jmusicbot/listener/HistoryInteractionListener.java
+@@ -26,7 +26,7 @@
+ import net.dv8tion.jda.api.components.textinput.TextInput;
+ import net.dv8tion.jda.api.components.textinput.TextInputStyle;
+ import net.dv8tion.jda.api.entities.MessageEmbed;
+-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
++import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+ import net.dv8tion.jda.api.events.interaction.ModalInteractionEvent;
+ import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+ import net.dv8tion.jda.api.hooks.ListenerAdapter;
+@@ -142,7 +142,7 @@ private void handleHistoryButton(ButtonInteractionEvent event) {
+                 return;
+             }
+             MusicService.OutputAdapter adapter = OutputAdapters.forHistoryReply(event);
+-            TextChannel channel = event.getChannel().asTextChannel();
++            GuildMessageChannel channel = event.getChannel().asGuildMessageChannel();
+             musicService.queueFromHistory(event.getGuild(), event.getMember(), selectedTrack, channel, adapter);
+             MusicService.HistoryInfo newInfo = musicService.getHistoryInfo(event.getGuild(), event.getJDA());
+             if (newInfo == null) {
+@@ -165,7 +165,7 @@ private void handleHistoryButton(ButtonInteractionEvent event) {
+                 return;
+             }
+             MusicService.OutputAdapter adapter = OutputAdapters.forHistoryReply(event);
+-            TextChannel channel = event.getChannel().asTextChannel();
++            GuildMessageChannel channel = event.getChannel().asGuildMessageChannel();
+             musicService.playFromHistoryNow(event.getGuild(), event.getMember(), selectedTrack, channel, adapter);
+             MusicService.HistoryInfo newInfo = musicService.getHistoryInfo(event.getGuild(), event.getJDA());
+             if (newInfo == null) {
+@@ -183,7 +183,7 @@ private void handleHistoryButton(ButtonInteractionEvent event) {
+                 return;
+             }
+             MusicService.OutputAdapter adapter = OutputAdapters.forHistoryReply(event);
+-            TextChannel channel = event.getChannel().asTextChannel();
++            GuildMessageChannel channel = event.getChannel().asGuildMessageChannel();
+             musicService.queueAllFromHistory(event.getGuild(), event.getMember(), channel, adapter);
+             MusicService.HistoryInfo newInfo = musicService.getHistoryInfo(event.getGuild(), event.getJDA());
+             if (newInfo == null) {
+diff --git a/src/main/java/com/jagrosh/jmusicbot/listener/PlaylistsInteractionListener.java b/src/main/java/com/jagrosh/jmusicbot/listener/PlaylistsInteractionListener.java
+index 4e9747c5b..44ca6c8a9 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/listener/PlaylistsInteractionListener.java
++++ b/src/main/java/com/jagrosh/jmusicbot/listener/PlaylistsInteractionListener.java
+@@ -24,7 +24,7 @@
+ import net.dv8tion.jda.api.components.actionrow.ActionRow;
+ import net.dv8tion.jda.api.components.selections.StringSelectMenu;
+ import net.dv8tion.jda.api.entities.MessageEmbed;
+-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
++import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+ import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+ import net.dv8tion.jda.api.events.interaction.component.StringSelectInteractionEvent;
+ import net.dv8tion.jda.api.hooks.ListenerAdapter;
+@@ -207,7 +207,7 @@ private void handlePlaylistDetailsButton(ButtonInteractionEvent event)
+                 return;
+             }
+ 
+-            TextChannel channel = event.getChannel().asTextChannel();
++            GuildMessageChannel channel = event.getChannel().asGuildMessageChannel();
+             MusicService.OutputAdapter output = OutputAdapters.forPlaylistsReply(event);
+             if (action.equals("queueall"))
+             {
+@@ -325,7 +325,7 @@ private void handlePlaylistDetailsButton(ButtonInteractionEvent event)
+             return;
+         }
+ 
+-        TextChannel channel = event.getChannel().asTextChannel();
++        GuildMessageChannel channel = event.getChannel().asGuildMessageChannel();
+         MusicService.OutputAdapter output = OutputAdapters.forPlaylistsReply(event);
+         String selectedTrackUrl = musicService.getPlaylistTrackUrlAtPosition(draftContext, selectedTrack);
+         if (selectedTrackUrl == null || selectedTrackUrl.isBlank())
+@@ -545,7 +545,7 @@ private void handlePlaylistsButton(ButtonInteractionEvent event)
+             return;
+         }
+ 
+-        TextChannel channel = event.getChannel().asTextChannel();
++        GuildMessageChannel channel = event.getChannel().asGuildMessageChannel();
+         MusicService.OutputAdapter output = OutputAdapters.forPlaylistsReply(event);
+         if (action.equals("queue"))
+         {
+diff --git a/src/main/java/com/jagrosh/jmusicbot/service/AudioLoadResultHandlers.java b/src/main/java/com/jagrosh/jmusicbot/service/AudioLoadResultHandlers.java
+index 5044f6262..32171ed5c 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/service/AudioLoadResultHandlers.java
++++ b/src/main/java/com/jagrosh/jmusicbot/service/AudioLoadResultHandlers.java
+@@ -30,7 +30,7 @@
+ import net.dv8tion.jda.api.components.buttons.Button;
+ import net.dv8tion.jda.api.entities.Guild;
+ import net.dv8tion.jda.api.entities.Member;
+-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
++import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+ import net.dv8tion.jda.api.entities.emoji.Emoji;
+ import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+ import net.dv8tion.jda.api.utils.messages.MessageEditBuilder;
+@@ -64,10 +64,10 @@ public static abstract class BaseResultHandler implements AudioLoadResultHandler
+         protected final Member member;
+         protected final String args;
+         protected final boolean ytsearch;
+-        protected final TextChannel channel;
++        protected final GuildMessageChannel channel;
+ 
+         protected BaseResultHandler(MusicService musicService, Bot bot, MusicService.OutputAdapter output,
+-                                     Guild guild, Member member, String args, boolean ytsearch, TextChannel channel)
++                                     Guild guild, Member member, String args, boolean ytsearch, GuildMessageChannel channel)
+         {
+             this.musicService = musicService;
+             this.bot = bot;
+@@ -133,7 +133,7 @@ public static class PlayResultHandler extends BaseResultHandler
+         private static final String CANCEL = "\uD83D\uDEAB"; // 🚫
+ 
+         public PlayResultHandler(MusicService musicService, Bot bot, MusicService.OutputAdapter output,
+-                                  Guild guild, Member member, String args, boolean ytsearch, TextChannel channel)
++                                  Guild guild, Member member, String args, boolean ytsearch, GuildMessageChannel channel)
+         {
+             super(musicService, bot, output, guild, member, args, ytsearch, channel);
+         }
+@@ -290,7 +290,7 @@ else if (count == 0)
+     public static class PlayNextResultHandler extends BaseResultHandler
+     {
+         public PlayNextResultHandler(MusicService musicService, Bot bot, MusicService.OutputAdapter output,
+-                                      Guild guild, Member member, String args, boolean ytsearch, TextChannel channel)
++                                      Guild guild, Member member, String args, boolean ytsearch, GuildMessageChannel channel)
+         {
+             super(musicService, bot, output, guild, member, args, ytsearch, channel);
+         }
+diff --git a/src/main/java/com/jagrosh/jmusicbot/service/MusicService.java b/src/main/java/com/jagrosh/jmusicbot/service/MusicService.java
+index d2596d8fe..cea8e808a 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/service/MusicService.java
++++ b/src/main/java/com/jagrosh/jmusicbot/service/MusicService.java
+@@ -38,7 +38,7 @@
+ import net.dv8tion.jda.api.entities.Member;
+ import net.dv8tion.jda.api.entities.Message;
+ import net.dv8tion.jda.api.entities.User;
+-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
++import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -177,14 +177,14 @@ public String formatTrackAddedMessage(String title, long duration, int position)
+      * @param member      The member adding the track
+      * @param track       The track to add
+      * @param queryArgs   The original query/args used to find this track
+-     * @param channel     The text channel for request metadata
++     * @param channel     The message-capable channel for request metadata
+      * @param adder       The strategy for adding the track to the queue
+      * @param reason      The reason to log (e.g., "added to the queue")
+      * @param logLocation Description for logging (e.g., "queue" or "front of queue")
+      * @return TrackAddResult containing position and formatted message, or null if track is too long
+      */
+     private TrackAddResult addTrackInternal(Guild guild, Member member, AudioTrack track,
+-                                            String queryArgs, TextChannel channel,
++                                            String queryArgs, GuildMessageChannel channel,
+                                             TrackAdder adder, String reason, String logLocation)
+     {
+         LOG.debug("Adding track to {}: guild={}, user={}, track={}",
+@@ -221,11 +221,11 @@ private TrackAddResult addTrackInternal(Guild guild, Member member, AudioTrack t
+      * @param member    The member adding the track
+      * @param track     The track to add
+      * @param queryArgs The original query/args used to find this track
+-     * @param channel   The text channel for request metadata
++     * @param channel   The message-capable channel for request metadata
+      * @return TrackAddResult containing position and formatted message, or null if track is too long
+      */
+     public TrackAddResult addTrackToQueue(Guild guild, Member member, AudioTrack track,
+-                                          String queryArgs, TextChannel channel)
++                                          String queryArgs, GuildMessageChannel channel)
+     {
+         return addTrackInternal(guild, member, track, queryArgs, channel,
+                 AudioHandler::addTrack, "added to the queue.", "queue");
+@@ -238,11 +238,11 @@ public TrackAddResult addTrackToQueue(Guild guild, Member member, AudioTrack tra
+      * @param member    The member adding the track
+      * @param track     The track to add
+      * @param queryArgs The original query/args used to find this track
+-     * @param channel   The text channel for request metadata
++     * @param channel   The message-capable channel for request metadata
+      * @return TrackAddResult containing position and formatted message, or null if track is too long
+      */
+     public TrackAddResult addTrackToFront(Guild guild, Member member, AudioTrack track,
+-                                          String queryArgs, TextChannel channel)
++                                          String queryArgs, GuildMessageChannel channel)
+     {
+         return addTrackInternal(guild, member, track, queryArgs, channel,
+                 AudioHandler::addTrackToFront, "added to the front of the queue.", "front of queue");
+@@ -250,7 +250,7 @@ public TrackAddResult addTrackToFront(Guild guild, Member member, AudioTrack tra
+ 
+     // ========== Player Operations ==========
+ 
+-    public void playNext(Guild guild, Member member, String args, TextChannel channel, OutputAdapter output)
++    public void playNext(Guild guild, Member member, String args, GuildMessageChannel channel, OutputAdapter output)
+     {
+         LOG.debug("PlayNext requested: guild={}, user={}, query={}",
+                 guild.getId(), member.getUser().getName(), args);
+@@ -272,7 +272,7 @@ public void playNext(Guild guild, Member member, String args, TextChannel channe
+                 bot.getAudioLoadWrapper().wrap(args, new AudioLoadResultHandlers.PlayNextResultHandler(this, bot, output, guild, member, args, false, channel)));
+     }
+ 
+-    public void play(Guild guild, Member member, String args, TextChannel channel, OutputAdapter output)
++    public void play(Guild guild, Member member, String args, GuildMessageChannel channel, OutputAdapter output)
+     {
+         LOG.debug("Play requested: guild={}, user={}, args={}",
+                 guild.getId(), member.getUser().getName(), args);
+@@ -1305,10 +1305,10 @@ public HistoryInfo getHistoryInfo(Guild guild, JDA jda)
+      * @param guild           The guild
+      * @param member          The member adding the track
+      * @param historyPosition 1-based position (1 = most recent)
+-     * @param channel         The text channel for request metadata
++     * @param channel         The message-capable channel for request metadata
+      * @param output          The output adapter
+      */
+-    public void queueFromHistory(Guild guild, Member member, int historyPosition, TextChannel channel, OutputAdapter output)
++    public void queueFromHistory(Guild guild, Member member, int historyPosition, GuildMessageChannel channel, OutputAdapter output)
+     {
+         AudioHandler handler = getHandler(guild);
+         if (handler == null)
+@@ -1360,10 +1360,10 @@ public void queueFromHistory(Guild guild, Member member, int historyPosition, Te
+      *
+      * @param guild   The guild
+      * @param member  The member adding the tracks
+-     * @param channel The text channel for request metadata
++     * @param channel The message-capable channel for request metadata
+      * @param output  The output adapter
+      */
+-    public void queueAllFromHistory(Guild guild, Member member, TextChannel channel, OutputAdapter output)
++    public void queueAllFromHistory(Guild guild, Member member, GuildMessageChannel channel, OutputAdapter output)
+     {
+         AudioHandler handler = getHandler(guild);
+         if (handler == null)
+@@ -1431,10 +1431,10 @@ public void queueAllFromHistory(Guild guild, Member member, TextChannel channel,
+      * @param guild           The guild
+      * @param member          The member
+      * @param historyPosition 1-based position (1 = most recent)
+-     * @param channel         The text channel for request metadata
++     * @param channel         The message-capable channel for request metadata
+      * @param output          The output adapter
+      */
+-    public void playFromHistoryNow(Guild guild, Member member, int historyPosition, TextChannel channel, OutputAdapter output)
++    public void playFromHistoryNow(Guild guild, Member member, int historyPosition, GuildMessageChannel channel, OutputAdapter output)
+     {
+         AudioHandler handler = getHandler(guild);
+         if (handler == null)
+@@ -1517,10 +1517,10 @@ public PlaylistNamesInfo getAvailablePlaylistNames()
+      * @param guild        The guild
+      * @param member       The member requesting playback
+      * @param playlistName The saved playlist name
+-     * @param channel      The text channel for request metadata
++     * @param channel      The message-capable channel for request metadata
+      * @param output       The output adapter
+      */
+-    public void queuePlaylist(Guild guild, Member member, String playlistName, TextChannel channel, OutputAdapter output)
++    public void queuePlaylist(Guild guild, Member member, String playlistName, GuildMessageChannel channel, OutputAdapter output)
+     {
+         PlaylistLoader.PlaylistResult<Playlist> playlistResult = bot.getPlaylistLoader().getPlaylistResult(playlistName);
+         if (!playlistResult.isSuccess())
+@@ -1579,10 +1579,10 @@ public void queuePlaylist(Guild guild, Member member, String playlistName, TextC
+      * @param guild        The guild
+      * @param member       The member requesting playback
+      * @param playlistName The saved playlist name
+-     * @param channel      The text channel for request metadata
++     * @param channel      The message-capable channel for request metadata
+      * @param output       The output adapter
+      */
+-    public void playPlaylistNow(Guild guild, Member member, String playlistName, TextChannel channel, OutputAdapter output)
++    public void playPlaylistNow(Guild guild, Member member, String playlistName, GuildMessageChannel channel, OutputAdapter output)
+     {
+         PlaylistLoader.PlaylistResult<Playlist> playlistResult = bot.getPlaylistLoader().getPlaylistResult(playlistName);
+         if (!playlistResult.isSuccess())
+@@ -1915,7 +1915,7 @@ public String getPlaylistTrackUrlAtPosition(PlaylistDraftContext context, int po
+     /**
+      * Loads a URL and adds it to the front of queue, then starts it immediately.
+      */
+-    public void playNowFromUrl(Guild guild, Member member, String url, TextChannel channel, OutputAdapter output)
++    public void playNowFromUrl(Guild guild, Member member, String url, GuildMessageChannel channel, OutputAdapter output)
+     {
+         if (url == null || url.isBlank())
+         {
+diff --git a/src/main/java/com/jagrosh/jmusicbot/service/SearchService.java b/src/main/java/com/jagrosh/jmusicbot/service/SearchService.java
+index de68fd58c..e1556d494 100644
+--- a/src/main/java/com/jagrosh/jmusicbot/service/SearchService.java
++++ b/src/main/java/com/jagrosh/jmusicbot/service/SearchService.java
+@@ -25,7 +25,7 @@
+ import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
+ import net.dv8tion.jda.api.entities.Guild;
+ import net.dv8tion.jda.api.entities.Member;
+-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
++import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -58,7 +58,7 @@ public SearchService(Bot bot)
+      * @param callback     The callback for handling results
+      */
+     public void search(Guild guild, Member member, String query, String searchPrefix,
+-                       TextChannel channel, SearchCallback callback)
++                       GuildMessageChannel channel, SearchCallback callback)
+     {
+         LOG.debug("Search requested: guild={}, user={}, query=\"{}\", prefix={}",
+                 guild.getId(), member.getUser().getName(), query, searchPrefix);
+@@ -134,11 +134,11 @@ private class SearchResultHandler implements AudioLoadResultHandler
+         private final Guild guild;
+         private final Member member;
+         private final String query;
+-        private final TextChannel channel;
++        private final GuildMessageChannel channel;
+         private final SearchCallback callback;
+ 
+         private SearchResultHandler(Guild guild, Member member, String query,
+-                                    TextChannel channel, SearchCallback callback)
++                                    GuildMessageChannel channel, SearchCallback callback)
+         {
+             this.guild = guild;
+             this.member = member;
+diff --git a/src/test/java/com/jagrosh/jmusicbot/testutil/commands/SlashCommandTestFixture.java b/src/test/java/com/jagrosh/jmusicbot/testutil/commands/SlashCommandTestFixture.java
+index 06b7546cb..1a5cdaad7 100644
+--- a/src/test/java/com/jagrosh/jmusicbot/testutil/commands/SlashCommandTestFixture.java
++++ b/src/test/java/com/jagrosh/jmusicbot/testutil/commands/SlashCommandTestFixture.java
+@@ -38,6 +38,7 @@
+ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
+ import net.dv8tion.jda.api.entities.channel.concrete.VoiceChannel;
+ import net.dv8tion.jda.api.entities.channel.unions.AudioChannelUnion;
++import net.dv8tion.jda.api.entities.channel.unions.GuildMessageChannelUnion;
+ import net.dv8tion.jda.api.events.interaction.command.CommandAutoCompleteInteractionEvent;
+ import net.dv8tion.jda.api.interactions.AutoCompleteQuery;
+ import net.dv8tion.jda.api.interactions.InteractionHook;
+@@ -132,7 +133,9 @@ private SlashCommandTestFixture()
+         member = mock(Member.class);
+         user = mock(User.class);
+         selfMember = mock(SelfMember.class);
+-        textChannel = mock(TextChannel.class);
++        // The command channel is also exposed through JDA's guild-channel union.
++        // This lets tests exercise the same path used by voice-channel text chat.
++        textChannel = mock(TextChannel.class, withSettings().extraInterfaces(GuildMessageChannelUnion.class));
+         audioManager = mock(AudioManager.class);
+         audioHandler = mock(AudioHandler.class);
+         selfVoiceState = mock(GuildVoiceState.class);
+@@ -190,6 +193,7 @@ private void setupDefaultRelationships()
+         when(event.getGuild()).thenReturn(guild);
+         when(event.getMember()).thenReturn(member);
+         when(event.getTextChannel()).thenReturn(textChannel);
++        when(event.getGuildChannel()).thenReturn((GuildMessageChannelUnion) textChannel);
+         when(event.getUser()).thenReturn(user);
+ 
+         // Client defaults
+diff --git a/src/test/java/com/jagrosh/jmusicbot/testutil/listener/ListenerTestFixture.java b/src/test/java/com/jagrosh/jmusicbot/testutil/listener/ListenerTestFixture.java
+index 7061540b0..c8425b04c 100644
+--- a/src/test/java/com/jagrosh/jmusicbot/testutil/listener/ListenerTestFixture.java
++++ b/src/test/java/com/jagrosh/jmusicbot/testutil/listener/ListenerTestFixture.java
+@@ -40,6 +40,7 @@
+ import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
+ import net.dv8tion.jda.api.entities.channel.concrete.VoiceChannel;
+ import net.dv8tion.jda.api.entities.channel.unions.AudioChannelUnion;
++import net.dv8tion.jda.api.entities.channel.unions.GuildMessageChannelUnion;
+ import net.dv8tion.jda.api.events.guild.GuildJoinEvent;
+ import net.dv8tion.jda.api.events.guild.voice.GuildVoiceUpdateEvent;
+ import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+@@ -150,7 +151,7 @@ private ListenerTestFixture()
+         user = mock(User.class);
+         selfMember = mock(SelfMember.class);
+         selfUser = mock(SelfUser.class);
+-        textChannel = mock(TextChannel.class);
++        textChannel = mock(TextChannel.class, withSettings().extraInterfaces(GuildMessageChannelUnion.class));
+         audioManager = mock(AudioManager.class);
+         audioHandler = mock(AudioHandler.class);
+         audioPlayer = mock(AudioPlayer.class);
+diff --git a/src/test/java/com/jagrosh/jmusicbot/unit/PlaylistsInteractionListenerTest.java b/src/test/java/com/jagrosh/jmusicbot/unit/PlaylistsInteractionListenerTest.java
+index ebd9931c3..7929c9949 100644
+--- a/src/test/java/com/jagrosh/jmusicbot/unit/PlaylistsInteractionListenerTest.java
++++ b/src/test/java/com/jagrosh/jmusicbot/unit/PlaylistsInteractionListenerTest.java
+@@ -19,6 +19,7 @@
+ import com.jagrosh.jmusicbot.service.MusicService;
+ import com.jagrosh.jmusicbot.testutil.listener.ListenerTestFixture;
+ import net.dv8tion.jda.api.entities.MessageEmbed;
++import net.dv8tion.jda.api.entities.channel.unions.GuildMessageChannelUnion;
+ import net.dv8tion.jda.api.entities.channel.unions.MessageChannelUnion;
+ import net.dv8tion.jda.api.requests.restaction.interactions.MessageEditCallbackAction;
+ import org.junit.jupiter.api.BeforeEach;
+@@ -85,7 +86,8 @@ void onButtonInteraction_queue_dispatchesToMusicService()
+                 .thenReturn(MusicService.PlaylistNamesInfo.success(List.of("favorite")));
+ 
+         MessageChannelUnion channelUnion = mock(MessageChannelUnion.class);
+-        when(channelUnion.asTextChannel()).thenReturn(fixture.getTextChannel());
++        when(channelUnion.asGuildMessageChannel())
++                .thenReturn((GuildMessageChannelUnion) fixture.getTextChannel());
+         when(fixture.getButtonInteractionEvent().getChannel()).thenReturn(channelUnion);
+ 
+         MessageEditCallbackAction editAction = mock(MessageEditCallbackAction.class);
+@@ -132,7 +134,8 @@ void onButtonInteraction_playlistDetailsQueueAll_dispatchesToMusicService()
+         when(fixture.getMusicService().getPlaylistTrackCount(any())).thenReturn(3);
+ 
+         MessageChannelUnion channelUnion = mock(MessageChannelUnion.class);
+-        when(channelUnion.asTextChannel()).thenReturn(fixture.getTextChannel());
++        when(channelUnion.asGuildMessageChannel())
++                .thenReturn((GuildMessageChannelUnion) fixture.getTextChannel());
+         when(channelUnion.getIdLong()).thenReturn(123L);
+         when(fixture.getButtonInteractionEvent().getChannel()).thenReturn(channelUnion);
+         when(fixture.getButtonInteractionEvent().getMessageIdLong()).thenReturn(456L);
+diff --git a/src/test/java/com/jagrosh/jmusicbot/unit/commands/v2/MusicSlashCommandTest.java b/src/test/java/com/jagrosh/jmusicbot/unit/commands/v2/MusicSlashCommandTest.java
+index 9bf845e61..b6a7ce519 100644
+--- a/src/test/java/com/jagrosh/jmusicbot/unit/commands/v2/MusicSlashCommandTest.java
++++ b/src/test/java/com/jagrosh/jmusicbot/unit/commands/v2/MusicSlashCommandTest.java
+@@ -19,6 +19,8 @@
+ import com.jagrosh.jmusicbot.testutil.commands.SlashCommandTestFixture;
+ import com.jagrosh.jmusicbot.testutil.commands.TestMusicSlashCommand;
+ import com.jagrosh.jmusicbot.testutil.commands.ValidationScenarioBuilder;
++import net.dv8tion.jda.api.entities.channel.ChannelType;
++import net.dv8tion.jda.api.entities.channel.unions.GuildMessageChannelUnion;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ 
+@@ -57,6 +59,24 @@ void testExecute_ValidCommand_CallsDoCommand()
+         assertTrue(command.wasDoCommandCalled(), "doCommand should be called for valid command");
+     }
+ 
++    @Test
++    void testExecute_VoiceChannelTextChat_DoesNotRequireTextChannelCast()
++    {
++        // Given: Discord exposes a voice channel's built-in chat as a guild message channel.
++        ValidationScenarioBuilder.with(fixture).validBasic().build();
++        GuildMessageChannelUnion voiceChat = mock(GuildMessageChannelUnion.class);
++        when(voiceChat.getType()).thenReturn(ChannelType.VOICE);
++        when(fixture.getEvent().getGuildChannel()).thenReturn(voiceChat);
++        command = TestMusicSlashCommand.createBasic(fixture.getBot());
++
++        // When
++        command.testExecute(fixture.getEvent());
++
++        // Then
++        assertTrue(command.wasDoCommandCalled(), "voice-channel chat should pass command validation");
++        verify(fixture.getEvent(), never()).getTextChannel();
++    }
++
+     // ==================== Text Channel Restriction Tests ====================
+ 
+     @Test
