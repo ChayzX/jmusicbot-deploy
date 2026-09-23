@@ -27,9 +27,9 @@ variables:
     description: "arif-banai/MusicBot tag to build (blank = newest stable tag)"
   BOT_IMAGE: $CI_REGISTRY_IMAGE/jmusicbot
   NOTIFIER_IMAGE: $CI_REGISTRY_IMAGE/release-notifier
-  # Build cache lives in its own registry repository: exporting it into the
-  # image's repository while the multi-arch index is being pushed made the
-  # GitLab registry reject the index ("blob unknown") on the first run.
+  # Build cache lives in its own registry repository (image-manifest=true is
+  # the cache format GitLab's registry documents), so cache blobs never mix
+  # with the image's tags.
   BOT_CACHE: $CI_REGISTRY_IMAGE/cache/jmusicbot:buildcache
   CLOUDFLARED_VERSION: "2026.7.3"
   CLOUDFLARED_SHA256: 9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17
@@ -81,6 +81,11 @@ stages: [prepare, build, deploy, verify, rollback]
   services: [docker:27-dind]
   variables:
     DOCKER_TLS_CERTDIR: /certs
+    # GitLab's registry intermittently rejects a multi-tag push whose index
+    # carries BuildKit provenance attestations ("blob unknown to registry":
+    # reproduced 4/8 with attestations vs 0/12 without). Nothing downstream
+    # verifies provenance, so leave it off.
+    BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
   before_script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     # QEMU so the amd64 runner can build the arm64 half (Oracle node).
