@@ -81,7 +81,10 @@ stages: [prepare, build, deploy, verify, rollback]
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     # QEMU so the amd64 runner can build the arm64 half (Oracle node).
     - docker run --privileged --rm tonistiigi/binfmt --install arm64
-    - docker buildx create --use --driver docker-container
+    # With dind TLS on, buildx can't build a builder from DOCKER_HOST/
+    # DOCKER_CERT_PATH env vars directly -- wrap them in a named context.
+    - docker context create dind-tls
+    - docker buildx create --use --driver docker-container dind-tls
 
 # Every cluster job: open the Cloudflare Access tunnel to the k3s API, point
 # kubectl at the scoped ci-deploy kubeconfig, and refuse anything that isn't
